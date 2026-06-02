@@ -1,1 +1,2 @@
-DASHSCOPE_API_KEY = "sk-c1f4a18a7f1f455e92206a21323c2d66"
+DASHSCOPE_API_KEY = "********************************"
+
