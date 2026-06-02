@@ -1,4 +1,5 @@
 import os
+import time
 from contextlib import asynccontextmanager
 
 from config.apikey import DASHSCOPE_API_KEY
@@ -8,7 +9,9 @@ from langchain_community.chat_models.tongyi import ChatTongyi
 from langchain_core.tools import create_retriever_tool
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+from analytics import analytics_router, extract_turn_data, init_db, log_turn
 from flow import pre_handler, post_handler, transfer_to_human
+from flow.state import get_state
 from rag import get_vectorstore, knowledge_router
 from tools import calculate, get_weather
 
@@ -28,6 +31,8 @@ SYSTEM_PROMPT = (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    init_db()
+
     vectorstore = get_vectorstore()
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
     rag_tool = create_retriever_tool(
@@ -49,19 +54,33 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(knowledge_router)
+app.include_router(analytics_router)
 
 
 @app.post("/chat")
 async def chat(message: str, thread_id: str = "default"):
+    config = {"configurable": {"thread_id": thread_id}}
+    t0 = time.perf_counter()
     res = app.state.agent.invoke(
         {"messages": [{"role": "user", "content": message}]},
-        config={"configurable": {"thread_id": thread_id}},
+        config=config,
     )
+    duration_ms = int((time.perf_counter() - t0) * 1000)
+
+    cs = get_state(thread_id)
+    turn_data = extract_turn_data(
+        messages=res["messages"],
+        thread_id=thread_id,
+        duration_ms=duration_ms,
+        stage=cs.stage.value,
+        turn_count=cs.turn_count,
+    )
+    log_turn(**turn_data)
+
     return {"response": res["messages"][-1].content}
 
 
 @app.get("/conversation/{thread_id}")
 async def conversation_state(thread_id: str):
-    from flow.state import get_state
     cs = get_state(thread_id)
     return cs.to_dict()

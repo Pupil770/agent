@@ -47,6 +47,20 @@
   - **轮次限制**：超过 `MAX_TURNS`（30轮）自动结束对话，返回兜底消息
   - **注入消息不累积**：每次注入的阶段指令是单条 SystemMessage，旧消息通过窗口机制自然淘汰
 
+### 6. 对话日志与分析（已完成）
+
+- **文件**: `analytics/db.py`, `analytics/extract.py`, `analytics/router.py`
+- **能力**:
+  - **对话日志记录**：每轮完整交互写入 SQLite（`analytics.db`），包括用户消息、AI 回复、工具调用及结果、RAG 使用情况、阶段、耗时
+  - **知识库命中率统计**：通过 `rag_used` / `rag_has_result` 布尔标志，聚合计算 RAG 调用率和命中率
+  - **高频问题挖掘**：按 `user_message` 分组统计频次，附带 RAG 命中情况，识别知识库盲区
+  - **满意度分析**：基于对话阶段分布代理，`ended_rate` 为满意代理，`transfer_rate` 为不满意代理
+- **接口**:
+  - `GET /analytics/logs` — 查询对话日志（支持 thread_id/日期过滤）
+  - `GET /analytics/rag-stats` — 知识库命中率统计
+  - `GET /analytics/frequent-questions` — 高频问题挖掘
+  - `GET /analytics/satisfaction` — 满意度分析
+
 ---
 
 ## 设计详解
@@ -209,9 +223,100 @@ pre_handler 被调用
 2. `pre_handler` 直接返回一条固定的结束 AIMessage，跳过 LLM 调用
 3. 用户再次发送消息时，如果包含问题关键词，会从 ENDED 重新开始到 INQUIRY
 
+### 三、对话日志与分析
+
+#### 架构
+
+日志记录发生在 `/chat` 端点——这是唯一能获取完整一轮交互数据（用户消息、工具调用链、AI 回复、耗时）的地方。Middleware 只在单次 LLM 调用前后运行，一轮带工具调用的对话可能触发多次 middleware，不适合做轮次级日志。
+
+```
+/chat 端点
+    │
+    ├── time.perf_counter() → t0
+    ├── agent.invoke() → res（完整消息列表）
+    ├── time.perf_counter() → t1，计算 duration_ms
+    │
+    ├── extract_turn_data(res["messages"])
+    │       ├── 提取最后一条 HumanMessage → user_message
+    │       ├── 提取最后一条无 tool_calls 的 AIMessage → ai_response
+    │       ├── 遍历所有 AIMessage.tool_calls → tool_calls[]
+    │       ├── 遍历所有 ToolMessage → tool_results[]
+    │       └── 检测 knowledge_base_search 调用 → rag_used, rag_has_result
+    │
+    └── log_turn(...) → 写入 analytics.db
+```
+
+#### 表结构
+
+```sql
+conversation_logs:
+  id              INTEGER PRIMARY KEY AUTOINCREMENT
+  thread_id       TEXT NOT NULL
+  turn_count     INTEGER NOT NULL
+  user_message    TEXT NOT NULL
+  ai_response     TEXT NOT NULL
+  tool_calls      TEXT DEFAULT '[]'    -- JSON: [{name, args}]
+  tool_results    TEXT DEFAULT '[]'    -- JSON: [{name, content(截断500字)}]
+  rag_used        INTEGER DEFAULT 0    -- 是否调用了 RAG
+  rag_has_result  INTEGER DEFAULT 0    -- RAG 是否返回了结果
+  stage           TEXT DEFAULT ''      -- 对话阶段
+  duration_ms     INTEGER DEFAULT 0    -- 耗时
+  created_at      TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now'))
+```
+
+关键设计：
+- `rag_used` / `rag_has_result` 为布尔标志，命中率统计无需解析 JSON
+- `tool_results` 内容截断 500 字符，完整数据在 LangGraph checkpointer 中
+- 数据库文件 `analytics.db` 与 `chat_history.db` 分离（关注点分离：checkpointer 管对话状态，analytics 管日志）
+
+#### RAG 命中检测
+
+当 LLM 决定使用知识库时，LangGraph 的消息序列为：
+
+```
+HumanMessage(content="退货政策是什么")
+  → AIMessage(tool_calls=[{name: "knowledge_base_search", args: {query: "退货政策"}}])
+  → ToolMessage(name="knowledge_base_search", content="检索到的文档...")
+  → AIMessage(content="基于知识库的回答...")
+```
+
+`extract_turn_data()` 扫描消息列表：
+- 发现 `AIMessage.tool_calls` 中 `name=="knowledge_base_search"` → `rag_used=True`
+- 通过 `tool_call_id` 关联到对应 `ToolMessage`，检查 content 非空 → `rag_has_result=True`
+- `rag_used=True` 且 `rag_has_result=False` → RAG 被调用但未命中
+
+#### 分析接口
+
+| 端点 | 用途 | 核心查询 |
+|------|------|---------|
+| `GET /analytics/logs` | 查询原始日志 | `SELECT * FROM conversation_logs WHERE ...` |
+| `GET /analytics/rag-stats` | RAG 命中率 | `SUM(rag_used) / COUNT(*)` = 调用率，`SUM(rag_has_result) / SUM(rag_used)` = 命中率 |
+| `GET /analytics/frequent-questions` | 高频问题 | `GROUP BY user_message ORDER BY COUNT(*) DESC`，附带 RAG 命中列识别知识库盲区 |
+| `GET /analytics/satisfaction` | 满意度 | `GROUP BY stage`，`ended_rate` = 正常结束占比，`transfer_rate` = 转人工占比 |
+
+#### 高频问题 → 知识库反馈循环
+
+运营工作流（非自动化代码）：
+
+1. 查询 `GET /analytics/frequent-questions`
+2. 识别 `count` 高但 `rag_hit_count` 为 0 的问题
+3. 这些是知识库未能回答的高频问题
+4. 针对这些主题创建文档，上传到 `POST /knowledge/upload`
+5. 下次同类问题即可命中 RAG
+
+#### 满意度代理方法
+
+项目没有显式用户反馈机制，使用对话阶段分布作为满意度代理：
+
+- **ended 阶段**：对话正常结束（用户满意或确认）→ 满意代理
+- **transferring 阶段**：对话转人工（未解决）→ 不满意代理
+- **answering/inquiry 阶段**：对话在这些阶段结束（可能未解决）
+
+如后续增加显式反馈（如评价按钮），可向表添加 `satisfaction_score` 列。
+
 ---
 
-### 三、设计优劣总结
+### 四、设计优劣总结
 
 #### 优势
 
@@ -224,6 +329,9 @@ pre_handler 被调用
 | **可观测性** | `last_stage`、`summary_length`、`turn_count` 便于调试 |
 | **线程安全** | `ConversationState` 使用 `threading.Lock` |
 | **兜底机制完备** | 转人工兜底、满意度确认兜底、超轮次兜底 |
+| **日志与分析分离** | `analytics.db` 与 `chat_history.db` 各司其职，互不干扰 |
+| **布尔标志加速查询** | `rag_used`/`rag_has_result` 避免解析 JSON 即可统计命中率 |
+| **高频问题直通知识库** | 分析→识别盲区→补充文档，闭环运营无需改代码 |
 
 #### 局限与权衡
 
@@ -235,6 +343,8 @@ pre_handler 被调用
 | **窗口基于轮数而非 token** | 可能窗口内消息本身就超长 | 可加 token 计数辅助判断 |
 | **摘要与指令共享 SystemMessage 通道** | LLM 可能混淆摘要上下文和流程指令 | 可区分摘要前缀和指令前缀 |
 | **无超时机制** | 阶段没有超时自动推进 | 可增加定时器触发 TRANSFERRING |
+| **满意度为代理指标** | 无显式用户反馈，用阶段分布近似 | 后续可加评价按钮 + `satisfaction_score` 列 |
+| **高频问题按原文分组** | 同义不同表述会分为多条 | 可用 LLM 做语义聚类，或用 embedding 相似度合并 |
 
 ---
 
@@ -259,15 +369,6 @@ pre_handler 被调用
 - 钉钉机器人
 
 需要一个适配层将各渠道消息统一转换为内部格式。
-
-### 6. 对话日志与分析
-
-记录每轮对话完整交互，用于运营分析：
-
-- 用户消息、工具调用、LLM 回答、耗时
-- 知识库命中率统计
-- 高频问题挖掘 → 反哺知识库补充
-- 满意度分析
 
 ### 7. 性能与安全
 
